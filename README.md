@@ -1,4 +1,4 @@
-# Raydium Pool DB
+# Raydium Pool Tracker
 
 This keeps track of live updates to Raydium pools using the Raydium API for initial load and using a RPC connection to Solana for live updates.
 

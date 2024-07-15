@@ -11,9 +11,8 @@ import (
 )
 
 const (
-	POOLDB_KEY      = "pools"
-	MINTDB_KEY      = "mints"
-	MIN_POOL_VOLUME = 1000
+	POOLDB_KEY = "pools"
+	MINTDB_KEY = "mints"
 )
 
 var ctx = context.Background()
@@ -41,13 +40,16 @@ func SetupRedis(address string) *RedisClient {
 	// res, _ := rdb.Ping(ctx).Result()
 	// fmt.Println("Redis Connection:", res)
 
-	_, err = rj.JSONGet(POOLDB_KEY, ".")
-	if err != nil && err.Error() == "redis: nil" {
-		_, err = rj.JSONSet(POOLDB_KEY, ".", map[string]interface{}{})
-		if err != nil {
-			fmt.Printf("Failed to create pools key: %v\n", err)
-			return nil
-		}
+	_, err = rj.JSONSet(POOLDB_KEY, ".", map[string]interface{}{})
+	if err != nil {
+		fmt.Printf("Failed to create pools key: %v\n", err)
+		return nil
+	}
+
+	_, err = rj.JSONSet(MINTDB_KEY, ".", map[string]interface{}{})
+	if err != nil {
+		fmt.Printf("Failed to create mints key: %v\n", err)
+		return nil
 	}
 
 	return &RedisClient{rdb: rdb, rj: rj}
@@ -92,7 +94,7 @@ type ResponseData struct {
 	Count       int        `json:"count"`
 }
 
-func (c *RedisClient) LoadRedisDB() error {
+func (c *RedisClient) LoadRedisDB(minPoolVolume float64) error {
 	// fetch all pages
 	baseUrl := "https://api-v3.raydium.io/pools/info/list?poolType=standard&poolSortField=volume24h&sortType=desc&pageSize=1000&page="
 	for page := 1; ; page++ {
@@ -112,7 +114,7 @@ func (c *RedisClient) LoadRedisDB() error {
 
 		// add pools to redis
 		for _, pool := range apiResp.Data.Data {
-			if pool.Day.Volume < MIN_POOL_VOLUME {
+			if pool.Day.Volume < minPoolVolume {
 				return nil
 			}
 			err = c.AddPoolToRedis(pool)
@@ -127,21 +129,7 @@ func (c *RedisClient) LoadRedisDB() error {
 	return nil
 }
 
-func (c *RedisClient) addMintInfo(mint Mint) error {
-	exists, err := c.rj.JSONGet(MINTDB_KEY, "$."+mint.Address)
-	if err != nil && err != redis.Nil {
-		return err
-	}
-	if exists == redis.Nil {
-		_, err = c.rj.JSONSet(MINTDB_KEY, "$."+mint.Address, mint)
-		if err != nil && err != redis.Nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (c *RedisClient) addSwappableMints(mintA, mintB string) error {
+func (c *RedisClient) SetSwappable(mintA, mintB string) error {
 	_, err := c.rdb.SAdd(ctx, "swappable:"+mintA, mintB).Result()
 	if err != nil {
 		return err
@@ -153,17 +141,25 @@ func (c *RedisClient) addSwappableMints(mintA, mintB string) error {
 	return nil
 }
 
+func (c *RedisClient) GetSwappable(mintA string) ([]string, error) {
+	mints, err := c.rdb.SMembers(ctx, "swappable:"+mintA).Result()
+	if err != nil {
+		return nil, err
+	}
+	return mints, nil
+}
+
 func (c *RedisClient) AddPoolToRedis(pool PoolInfo) error {
-	err := c.addMintInfo(pool.MintA)
+	err := c.SetMint(pool.MintA)
 	if err != nil {
 		return err
 	}
-	err = c.addMintInfo(pool.MintB)
+	err = c.SetMint(pool.MintB)
 	if err != nil {
 		return err
 	}
 
-	err = c.addSwappableMints(pool.MintA.Address, pool.MintB.Address)
+	err = c.SetSwappable(pool.MintA.Address, pool.MintB.Address)
 	if err != nil {
 		return err
 	}
@@ -182,20 +178,23 @@ func (p *PoolInfo) PoolKey() string {
 	return p.MintB.Address + ":" + p.MintA.Address
 }
 
-func (c *RedisClient) SetPool(pool PoolInfo) error {
+func jsonPath(pool PoolInfo) string {
+	return "." + pool.PoolKey() + "." + pool.PoolID
+}
 
+func (c *RedisClient) SetPool(pool PoolInfo) error {
 	// Ensure the parent key for the specific pool key exists
 	poolKey := pool.PoolKey()
 	_, err := c.rj.JSONGet(POOLDB_KEY, "."+poolKey)
-	if err != nil && err == redis.Nil {
+	if err != nil && err != redis.Nil {
 		_, err = c.rj.JSONSet(POOLDB_KEY, "."+poolKey, map[string]interface{}{})
 		if err != nil {
 			return err
 		}
 	}
 
-	path := "." + pool.PoolKey() + "." + pool.PoolID
-	_, err = c.rj.JSONSet(POOLDB_KEY, path, pool)
+	// Set the pool data
+	_, err = c.rj.JSONSet(POOLDB_KEY, jsonPath(pool), pool)
 	if err != nil {
 		return err
 	}
@@ -204,11 +203,44 @@ func (c *RedisClient) SetPool(pool PoolInfo) error {
 
 func (c *RedisClient) GetPool(poolKey, poolID string) (PoolInfo, error) {
 	var pool PoolInfo
-	_, err := c.rj.JSONGet("pools", "."+poolKey+"."+poolID)
+	path := "." + poolKey + "." + poolID
+	result, err := c.rj.JSONGet(POOLDB_KEY, path)
+	if err != nil {
+		return pool, err
+	}
+	err = json.Unmarshal(result.([]byte), &pool)
 	if err != nil {
 		return pool, err
 	}
 	return pool, nil
+}
+
+func (c *RedisClient) SetMint(mint Mint) error {
+	exists, _ := c.rj.JSONGet(MINTDB_KEY, "."+mint.Address)
+	// if exists, quit
+	if exists == nil {
+		_, err := c.rj.JSONSet(MINTDB_KEY, "."+mint.Address, mint)
+		if err != nil && err != redis.Nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *RedisClient) GetMint(address string) (Mint, error) {
+	var mint Mint
+	result, err := c.rj.JSONGet(MINTDB_KEY, "."+address)
+	if err != nil {
+		return mint, err
+	}
+	err = json.Unmarshal(result.([]byte), &mint)
+	if err != nil {
+		return mint, err
+	}
+	if mint.Address == "" {
+		return mint, fmt.Errorf("mint not found")
+	}
+	return mint, nil
 }
 
 func (c *RedisClient) Close() error {
